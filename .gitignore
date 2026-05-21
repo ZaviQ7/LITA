@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# ML weights / Large binary files
+*.pt
+*.onnx
+
+# Whitelist portraits (personal photos should not be tracked)
+whitelist/*
+!whitelist/README.md
+
+# OS files
+.DS_Store
+Thumbs.db
