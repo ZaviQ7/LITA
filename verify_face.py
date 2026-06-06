@@ -42,7 +42,7 @@ def main():
     x1, y1, x2, y2 = person_det["box"]
     
     box_h = y2 - y1
-    face_crop = frame[y1:y1 + int(box_h * 0.4), x1:x2]
+    face_crop = frame[y1:y1 + int(box_h * 0.75), x1:x2]
     
     portrait_path = os.path.join(whitelist_dir, "jane.jpg")
     cv2.imwrite(portrait_path, face_crop)
