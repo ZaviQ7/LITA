@@ -1,274 +1,353 @@
 import os
 import re
 import time
+
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import torch
 from deepface import DeepFace
+from ultralytics import YOLO
+
 import config
+from evidence import WeaponEvidence, box_iou
+
 
 class ThreatInference:
     def __init__(self):
-        print(f"[ThreatInference] Loading YOLO model: {config.YOLO_MODEL_NAME}...")
-        self.yolo = YOLO(config.YOLO_MODEL_NAME)
-        import torch
         self.device = config.YOLO_DEVICE
         self.half = config.YOLO_HALF
         if "cuda" in str(self.device).lower() and not torch.cuda.is_available():
-            print(f"[ThreatInference] WARNING: CUDA requested but not available. Falling back to CPU.")
+            print("[ThreatInference] CUDA requested but unavailable; using CPU.")
             self.device = "cpu"
             self.half = False
-        print(f"[ThreatInference] YOLO initialized on {self.device} with half={self.half}")
+
+        print(f"[ThreatInference] Loading base detector: {config.YOLO_MODEL_NAME}")
+        self.yolo = YOLO(config.YOLO_MODEL_NAME)
+
+        self.weapon_yolo = None
+        if os.path.isfile(config.WEAPON_MODEL_PATH):
+            print(f"[ThreatInference] Loading dedicated weapon model: {config.WEAPON_MODEL_PATH}")
+            self.weapon_yolo = YOLO(config.WEAPON_MODEL_PATH)
+        else:
+            print(
+                "[ThreatInference] Dedicated weapon weights not found; "
+                "using COCO knife/scissors fallback only."
+            )
+
+        self.weapon_evidence = WeaponEvidence(
+            window_seconds=config.WEAPON_WINDOW_SECONDS,
+            min_hits=config.WEAPON_MIN_HITS,
+            min_mean_conf=config.WEAPON_MIN_MEAN_CONF,
+            immediate_conf=config.WEAPON_IMMEDIATE_CONF,
+            iou_threshold=config.WEAPON_TRACK_IOU_THRESHOLD,
+            stale_seconds=config.WEAPON_TRACK_STALE_SECONDS,
+        )
 
         self.whitelist_dir = config.WHITELIST_DIR
         os.makedirs(self.whitelist_dir, exist_ok=True)
-        self.write_whitelist_readme()
-
         self.whitelist_cache = {}
+        self.face_track_cache = {}
+        self._pseudo_track_counter = -1
         self.load_whitelist()
-
-        # Track-based cache mapping track_id -> {"label": str, "is_known": bool, "last_verified": float, "box": [x1, y1, x2, y2]}
-        self.track_cache = {}
-        self._pseudo_track_counter = 0
-
-    def write_whitelist_readme(self):
-        readme_path = os.path.join(self.whitelist_dir, "README.md")
-        if not os.path.exists(readme_path):
-            with open(readme_path, "w") as f:
-                f.write("# LITA Whitelist Portraits Directory\n\n"
-                        "Drop your authenticated `.jpg` (or `.png`) portrait profiles in this directory.\n"
-                        "LITA will pre-compute and cache facial embeddings for these files at startup.\n\n"
-                        "Naming convention:\n"
-                        "Use the person's name as the filename (e.g., `john_doe.jpg` or `jane_doe.jpg`).\n"
-                        "LITA will display this name as the 'KNOWN' label on the HUD.\n")
-            print(f"[ThreatInference] Created whitelist README at {readme_path}")
 
     @staticmethod
     def _normalize_name(filename):
         stem = os.path.splitext(filename)[0]
-        stem = re.sub(r'[_\s]?\d+$', '', stem)
+        stem = re.sub(r"[_\s]?\d+$", "", stem)
         return stem.replace("_", " ").title()
 
-    def load_whitelist(self):
-        print(f"[ThreatInference] Initializing Whitelist Database from '{self.whitelist_dir}'...")
-        valid_extensions = (".jpg", ".jpeg", ".png")
-        files = [f for f in os.listdir(self.whitelist_dir) if f.lower().endswith(valid_extensions)]
+    @staticmethod
+    def _cosine_distance(a, b):
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 1.0
+        return 1.0 - float(np.dot(a, b) / (na * nb))
 
+    @staticmethod
+    def _face_quality(face):
+        if face is None or face.size == 0:
+            return 0.0
+        h, w = face.shape[:2]
+        if min(h, w) < config.FACE_MIN_SIZE:
+            return 0.0
+        gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+        sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+        brightness = float(gray.mean())
+        sharp_score = min(sharpness / 250.0, 1.0)
+        light_score = max(0.0, 1.0 - abs(brightness - 128.0) / 128.0)
+        return 0.7 * sharp_score + 0.3 * light_score
+
+    def _represent(self, image, enforce_detection=True):
+        last_error = None
+        for backend in config.FACE_DETECTOR_BACKENDS:
+            try:
+                reps = DeepFace.represent(
+                    img_path=image,
+                    model_name=config.FACE_MODEL,
+                    detector_backend=backend,
+                    enforce_detection=enforce_detection,
+                    align=True,
+                )
+                if reps:
+                    return reps, backend
+            except Exception as exc:
+                last_error = exc
+        if last_error and enforce_detection:
+            return [], None
+        return [], None
+
+    def load_whitelist(self):
+        valid = (".jpg", ".jpeg", ".png")
+        files = sorted(f for f in os.listdir(self.whitelist_dir) if f.lower().endswith(valid))
         if not files:
-            print("[ThreatInference] Whitelist database is currently empty. Drop .jpg portraits to verify known individuals.")
+            print("[ThreatInference] Whitelist is empty.")
             return
 
-        for file in files:
-            name = self._normalize_name(file)
-            path = os.path.join(self.whitelist_dir, file)
-            try:
-                representations = DeepFace.represent(
-                    img_path=path,
-                    model_name=config.FACE_MODEL,
-                    enforce_detection=False,
-                    detector_backend="ssd"
-                )
-                if representations:
-                    embedding = np.array(representations[0]["embedding"])
-                    if name not in self.whitelist_cache:
-                        self.whitelist_cache[name] = []
-                    self.whitelist_cache[name].append(embedding)
-                    count = len(self.whitelist_cache[name])
-                    print(f"[ThreatInference] Cached whitelist profile: '{name}' (embedding #{count} from {file})")
-            except Exception as e:
-                print(f"[ThreatInference] WARNING: Failed to compute embedding for {file}: {e}")
-
-        total_embeddings = sum(len(v) for v in self.whitelist_cache.values())
-        print(f"[ThreatInference] Whitelist load completed. {len(self.whitelist_cache)} identities, {total_embeddings} total embeddings.")
-
-    def _extract_face_embedding(self, person_crop):
-        h, w = person_crop.shape[:2]
-        if h <= 0 or w <= 0:
-            return None
-
-        for ratio in config.FACE_CROP_RATIOS:
-            face_region = person_crop[0:int(h * ratio), 0:w]
-            try:
-                representations = DeepFace.represent(
-                    img_path=face_region,
-                    model_name=config.FACE_MODEL,
-                    enforce_detection=False,
-                    detector_backend="ssd"
-                )
-                if representations:
-                    return np.array(representations[0]["embedding"])
-            except Exception as e:
-                print(f"[ThreatInference] _extract_face_embedding error: {e}")
+        for filename in files:
+            name = self._normalize_name(filename)
+            path = os.path.join(self.whitelist_dir, filename)
+            reps, backend = self._represent(path, enforce_detection=True)
+            if not reps:
+                print(f"[ThreatInference] Skipping unusable whitelist image: {filename}")
                 continue
+            for rep in reps:
+                embedding = np.asarray(rep["embedding"], dtype=np.float32)
+                self.whitelist_cache.setdefault(name, []).append(embedding)
+            print(f"[ThreatInference] Enrolled {name} via {backend}: {filename}")
 
-        return None
+        total = sum(len(v) for v in self.whitelist_cache.values())
+        print(f"[ThreatInference] Whitelist: {len(self.whitelist_cache)} identities / {total} embeddings.")
 
-    def _find_track_by_iou(self, box, threshold=0.4):
-        best_track_id = None
-        max_iou = threshold
-        for tid, track in self.track_cache.items():
-            tb = track.get("box")
-            if not tb:
-                continue
-            xi1 = max(box[0], tb[0])
-            yi1 = max(box[1], tb[1])
-            xi2 = min(box[2], tb[2])
-            yi2 = min(box[3], tb[3])
-            inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-            box_area = (box[2] - box[0]) * (box[3] - box[1])
-            tb_area = (tb[2] - tb[0]) * (tb[3] - tb[1])
-            union_area = box_area + tb_area - inter_area
-            if union_area > 0:
-                iou = inter_area / union_area
-                if iou > max_iou:
-                    max_iou = iou
-                    best_track_id = tid
-        return best_track_id
+    def _face_track_key(self, track_id, box):
+        if track_id is not None:
+            return ("id", int(track_id))
+        best = None
+        best_iou = 0.40
+        for key, cached in self.face_track_cache.items():
+            score = box_iou(box, cached.get("box"))
+            if score > best_iou:
+                best_iou = score
+                best = key
+        if best is not None:
+            return best
+        key = ("pseudo", self._pseudo_track_counter)
+        self._pseudo_track_counter -= 1
+        return key
+
+    def _cleanup_faces(self, now):
+        stale = [
+            k
+            for k, v in self.face_track_cache.items()
+            if now - v["last_seen"] > config.FACE_TRACK_STALE_SECONDS
+        ]
+        for key in stale:
+            del self.face_track_cache[key]
 
     def verify_face(self, person_crop, track_id=None, box=None):
-        if not self.whitelist_cache:
-            return False, "UNKNOWN", 1.0
-
         now = time.time()
-        
-        # Clean up stale track caches that haven't been seen for 10 seconds
-        stale_threshold = 10.0
-        stale_keys = [k for k, v in self.track_cache.items() if now - v["last_verified"] > stale_threshold]
-        for k in stale_keys:
-            del self.track_cache[k]
+        self._cleanup_faces(now)
+        key = self._face_track_key(track_id, box)
 
-        # Fallback to IoU tracking if track_id is not provided but box is
-        if track_id is None and box is not None:
-            track_id = self._find_track_by_iou(box)
-            if track_id is None:
-                self._pseudo_track_counter -= 1
-                track_id = self._pseudo_track_counter
+        cached = self.face_track_cache.get(key)
+        if cached:
+            ttl = (
+                config.FACE_CACHE_TTL_KNOWN
+                if cached["identity_state"] == "KNOWN"
+                else config.FACE_CACHE_TTL_UNKNOWN
+            )
+            cached["last_seen"] = now
+            cached["box"] = box
+            if now - cached["last_verified"] < ttl:
+                return cached.copy()
 
-        # Check if we already have a cached result for this track_id
-        if track_id is not None and track_id in self.track_cache:
-            entry = self.track_cache[track_id]
-            if box is not None:
-                entry["box"] = box
-            
-            ttl = config.FACE_CACHE_TTL if entry["is_known"] else getattr(config, "FACE_RECOGNITION_COOLDOWN", 1.5)
-            if now - entry["last_verified"] < ttl:
-                return entry["is_known"], entry["label"], entry.get("distance", 1.0)
-
-        # Run face embedding extraction
-        crop_emb = self._extract_face_embedding(person_crop)
-        if crop_emb is None:
-            is_known = False
-            label = "UNKNOWN"
-            distance = 1.0
-        else:
-            best_match = "UNKNOWN"
-            min_distance = 1.0
-            norm_crop = np.linalg.norm(crop_emb)
-            if norm_crop == 0:
-                is_known = False
-                label = "UNKNOWN"
-                distance = 1.0
-            else:
-                for name, embeddings_list in self.whitelist_cache.items():
-                    for whitelist_emb in embeddings_list:
-                        norm_crop = np.linalg.norm(crop_emb)
-                        norm_white = np.linalg.norm(whitelist_emb)
-                        if norm_crop > 0 and norm_white > 0:
-                            similarity = np.dot(crop_emb, whitelist_emb) / (norm_crop * norm_white)
-                            distance = 1.0 - similarity
-                            if distance < min_distance:
-                                min_distance = distance
-                                best_match = name
-
-                threshold = config.FACE_MODELS[config.FACE_MODEL]["threshold"]
-                if min_distance <= threshold:
-                    is_known = True
-                    label = best_match
-                    print(f"[ThreatInference] Verified identity: '{best_match}' (distance = {min_distance:.3f}, track = {track_id})")
-                else:
-                    is_known = False
-                    label = "UNKNOWN"
-
-        # Update cache
-        if track_id is not None:
-            self.track_cache[track_id] = {
-                "is_known": is_known,
-                "label": label,
-                "distance": distance,
-                "last_verified": now,
-                "box": box
+        if not self.whitelist_cache:
+            result = {
+                "identity_state": "UNVERIFIED",
+                "identity": None,
+                "distance": None,
+                "face_quality": 0.0,
+                "reason": "empty_whitelist",
             }
+            return self._cache_face(key, box, now, result)
 
-        return is_known, label, min_distance if 'min_distance' in locals() else distance
+        reps, backend = self._represent(person_crop, enforce_detection=True)
+        if not reps:
+            result = {
+                "identity_state": "UNVERIFIED",
+                "identity": None,
+                "distance": None,
+                "face_quality": 0.0,
+                "reason": "no_reliable_face",
+            }
+            return self._cache_face(key, box, now, result)
 
-    def run_inference(self, frame):
-        # Run tracking if possible, otherwise fallback to standard YOLO detection
+        rep = max(reps, key=lambda r: r.get("facial_area", {}).get("w", 0) * r.get("facial_area", {}).get("h", 0))
+        area = rep.get("facial_area", {})
+        x, y, w, h = (area.get("x", 0), area.get("y", 0), area.get("w", 0), area.get("h", 0))
+        face_crop = person_crop[max(0, y): max(0, y) + max(0, h), max(0, x): max(0, x) + max(0, w)]
+        quality = self._face_quality(face_crop)
+        if quality < config.FACE_MIN_QUALITY:
+            result = {
+                "identity_state": "UNVERIFIED",
+                "identity": None,
+                "distance": None,
+                "face_quality": quality,
+                "reason": "low_face_quality",
+            }
+            return self._cache_face(key, box, now, result)
+
+        query = np.asarray(rep["embedding"], dtype=np.float32)
+        candidates = []
+        for name, embeddings in self.whitelist_cache.items():
+            distances = sorted(self._cosine_distance(query, emb) for emb in embeddings)
+            top = distances[: max(1, min(config.FACE_MATCH_TOP_K, len(distances)))]
+            candidates.append((sum(top) / len(top), name, top))
+
+        candidates.sort(key=lambda item: item[0])
+        best_distance, best_name, best_distances = candidates[0]
+        threshold = config.FACE_MODELS[config.FACE_MODEL]["threshold"]
+        votes = sum(distance <= threshold for distance in best_distances)
+        required_votes = min(config.FACE_MATCH_MIN_VOTES, len(best_distances))
+        is_known = best_distance <= threshold and votes >= required_votes
+
+        result = {
+            "identity_state": "KNOWN" if is_known else "UNKNOWN",
+            "identity": best_name if is_known else None,
+            "candidate": best_name,
+            "distance": best_distance,
+            "face_quality": quality,
+            "reason": "matched" if is_known else "no_whitelist_match",
+            "face_backend": backend,
+        }
+        return self._cache_face(key, box, now, result)
+
+    def _cache_face(self, key, box, now, result):
+        cached = dict(result)
+        cached.update({"box": box, "last_seen": now, "last_verified": now})
+        self.face_track_cache[key] = cached
+        return dict(result)
+
+    def _run_base_detector(self, frame):
+        kwargs = dict(
+            device=self.device,
+            half=self.half,
+            verbose=False,
+            imgsz=config.YOLO_IMGSZ,
+            conf=config.YOLO_CONF,
+            classes=config.YOLO_CLASS_IDS,
+        )
         try:
-            results = self.yolo.track(
-                frame, device=self.device, half=self.half, verbose=False,
-                imgsz=config.YOLO_IMGSZ, conf=config.YOLO_CONF,
-                classes=config.YOLO_CLASS_IDS, persist=True
+            return self.yolo.track(
+                frame,
+                tracker=config.YOLO_TRACKER,
+                persist=True,
+                **kwargs,
             )
         except Exception:
-            results = self.yolo(
-                frame, device=self.device, half=self.half, verbose=False,
-                imgsz=config.YOLO_IMGSZ, conf=config.YOLO_CONF,
-                classes=config.YOLO_CLASS_IDS
+            return self.yolo(frame, **kwargs)
+
+    @staticmethod
+    def _track_id(box):
+        if getattr(box, "id", None) is not None:
+            return int(box.id[0].item())
+        return None
+
+    def _weapon_name(self, raw_name):
+        normalized = str(raw_name).lower().strip().replace("-", " ")
+        return config.WEAPON_CLASS_ALIASES.get(normalized, normalized.replace(" ", "_"))
+
+    def _weapon_detection(self, box, names):
+        cls_id = int(box.cls[0].item())
+        raw_name = names[cls_id]
+        class_name = self._weapon_name(raw_name)
+        conf = float(box.conf[0].item())
+        coords = box.xyxy[0].cpu().numpy().astype(int).tolist()
+        det = {
+            "box": coords,
+            "class": class_name,
+            "confidence": conf,
+            "label": class_name.upper(),
+            "track_id": self._track_id(box),
+            "kind": "weapon",
+        }
+        det.update(self.weapon_evidence.update(det))
+        det["label"] = f"{det['weapon_state']}: {class_name.upper()}"
+        return det
+
+    def _run_weapon_model(self, frame):
+        if self.weapon_yolo is None:
+            return []
+        try:
+            results = self.weapon_yolo.track(
+                frame,
+                device=self.device,
+                half=self.half,
+                verbose=False,
+                imgsz=config.WEAPON_MODEL_IMGSZ,
+                conf=config.WEAPON_MODEL_CONF,
+                tracker=config.YOLO_TRACKER,
+                persist=True,
             )
-
-        detections = []
-
+        except Exception:
+            results = self.weapon_yolo(
+                frame,
+                device=self.device,
+                half=self.half,
+                verbose=False,
+                imgsz=config.WEAPON_MODEL_IMGSZ,
+                conf=config.WEAPON_MODEL_CONF,
+            )
         if not results:
-            return detections
+            return []
+        return [self._weapon_detection(box, self.weapon_yolo.names) for box in results[0].boxes]
 
-        result = results[0]
-        boxes = result.boxes
+    def run_inference(self, frame):
+        detections = []
+        results = self._run_base_detector(frame)
+        if results:
+            for box in results[0].boxes:
+                cls_id = int(box.cls[0].item())
+                class_name = self.yolo.names[cls_id]
+                conf = float(box.conf[0].item())
+                if conf < config.YOLO_CLASS_CONF.get(class_name, config.YOLO_CONF):
+                    continue
 
-        for box in boxes:
-            cls_id = int(box.cls[0].item())
-            class_name = self.yolo.names[cls_id]
-            conf = float(box.conf[0].item())
+                coords = box.xyxy[0].cpu().numpy().astype(int).tolist()
+                x1, y1, x2, y2 = coords
+                track_id = self._track_id(box)
 
-            min_conf = config.YOLO_CLASS_CONF.get(class_name, config.YOLO_CONF)
-            if conf < min_conf:
-                continue
+                if class_name == "person":
+                    h, w = frame.shape[:2]
+                    x1c, y1c = max(0, x1), max(0, y1)
+                    x2c, y2c = min(w, x2), min(h, y2)
+                    identity = {
+                        "identity_state": "UNVERIFIED",
+                        "identity": None,
+                        "distance": None,
+                    }
+                    if x2c > x1c and y2c > y1c:
+                        identity = self.verify_face(
+                            frame[y1c:y2c, x1c:x2c],
+                            track_id=track_id,
+                            box=coords,
+                        )
+                    state = identity["identity_state"]
+                    label = f"KNOWN: {identity['identity']}" if state == "KNOWN" else state
+                    detections.append(
+                        {
+                            "box": coords,
+                            "class": "person",
+                            "kind": "person",
+                            "confidence": conf,
+                            "track_id": track_id,
+                            "label": label,
+                            **identity,
+                        }
+                    )
+                elif self.weapon_yolo is None:
+                    # COCO fallback only. A dedicated model supersedes these detections.
+                    detections.append(self._weapon_detection(box, self.yolo.names))
 
-            xyxy = box.xyxy[0].cpu().numpy().astype(int)
-            x1, y1, x2, y2 = xyxy
-
-            # Extract track_id from box if present
-            track_id = None
-            if hasattr(box, 'id') and box.id is not None:
-                track_id = int(box.id[0].item())
-
-            detection = {
-                "box": [x1, y1, x2, y2],
-                "class": class_name,
-                "confidence": conf,
-                "label": class_name.upper()
-            }
-
-            if class_name == "person":
-                h, w = frame.shape[:2]
-                x1_c, y1_c = max(0, x1), max(0, y1)
-                x2_c, y2_c = min(w, x2), min(h, y2)
-                
-                if x2_c > x1_c and y2_c > y1_c:
-                    person_crop = frame[y1_c:y2_c, x1_c:x2_c]
-                    is_known, label, distance = self.verify_face(person_crop, track_id=track_id, box=[x1, y1, x2, y2])
-                    
-                    if is_known:
-                        detection["label"] = f"KNOWN: {label}"
-                        detection["is_known"] = True
-                    else:
-                        detection["label"] = "UNKNOWN"
-                        detection["is_known"] = False
-                else:
-                    detection["label"] = "UNKNOWN"
-                    detection["is_known"] = False
-            else:
-                detection["label"] = "WEAPON"
-
-            detections.append(detection)
-
+        detections.extend(self._run_weapon_model(frame))
         return detections
