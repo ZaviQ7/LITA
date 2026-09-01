@@ -1,0 +1,14 @@
+{
+  "samples": [
+    {
+      "path": "benchmarks/images/no_weapon_001.jpg",
+      "expect_weapon": false,
+      "expect_person": true
+    },
+    {
+      "path": "benchmarks/images/weapon_001.jpg",
+      "expect_weapon": true,
+      "expect_person": true
+    }
+  ]
+}
